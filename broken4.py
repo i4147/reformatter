@@ -1,1 +1,12 @@
-import ast, pathlib, collections opt=pep604=0 files_opt=[]; files_604=[] for f in sorted(pathlib.Path('.').glob('*.py')): s=f.read_text() o=s.count("Optional["); n=s.count("| None")+s.count("|None") if o: files_opt.append((o,f.name)) if n: files_604.append((n,f.name)) print("files with Optional:", len(files_opt), "files with |None:", len(files_604)) print("both:", len({x[1] for x in files_opt}&{x[1] for x in files_604}))
+import ast, pathlib, collections
+opt=pep604=0
+files_opt=[]; files_604=[]
+for f in sorted(pathlib.Path('.').glob('*.py')):
+    s=f.read_text()
+    o=s.count("Optional["); n=s.count("| None")+s.count("|None")
+    if o:
+        files_opt.append((o,f.name))
+    if n:
+        files_604.append((n,f.name))
+print("files with Optional:", len(files_opt), "files with |None:", len(files_604))
+print("both:", len({x[1] for x in files_opt}&{x[1] for x in files_604}))

@@ -1,1 +1,12 @@
-import ast, pathlib, collections # survey common param usage patterns to design heuristics pat=collections.Counter() for f in sorted(pathlib.Path('.').glob('*.py')): try: t=ast.parse(f.read_text()) except: continue for n in ast.walk(t): if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute): pat[n.func.attr]+=1 print([p for p,_ in pat.most_common(60)])
+import ast, pathlib, collections
+# survey common param usage patterns to design heuristics
+pat=collections.Counter()
+for f in sorted(pathlib.Path('.').glob('*.py')):
+    try:
+        t=ast.parse(f.read_text())
+    except:
+        continue
+    for n in ast.walk(t):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+            pat[n.func.attr]+=1
+print([p for p,_ in pat.most_common(60)])
