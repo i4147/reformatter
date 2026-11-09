@@ -90,6 +90,7 @@ METHOD_DECORATOR_NAMES: frozenset[str] = frozenset(
         "property",
         "cached_property",
         "abstractmethod",
+        "overload",
     }
 )
 
@@ -194,6 +195,7 @@ class LogicalChunk:
 
     code: str
     inline_comment: str = ""
+    blank_lines_before: int = 0
 
 
 @dataclass(frozen=True)
@@ -210,6 +212,7 @@ class ParsedLine:
     calls: frozenset[str] = frozenset()
     writes: frozenset[str] = frozenset()
     frame_bound: frozenset[str] = frozenset()
+    cond_vars: frozenset[str] = frozenset()
     isinstance_vars: frozenset[str] = frozenset()
     hasattr_pairs: frozenset[tuple[str, str]] = frozenset()
     cond_sig: tuple[str, str] | None = None
@@ -217,6 +220,7 @@ class ParsedLine:
     is_terminal: bool = False
     is_return_or_raise: bool = False
     needs_func: bool = False
+    needs_nonlocal: bool = False
     is_global_stmt: bool = False
     needs_async: bool = False
     needs_loop: bool = False
@@ -224,6 +228,10 @@ class ParsedLine:
     is_method_decorator: bool = False
     is_main_guard: bool = False
     is_valueless_ann: bool = False
+    is_ann_assign: bool = False
+    is_docstring: bool = False
+    is_import: bool = False
+    blank_lines_before: int = 0
 
 
 @dataclass(frozen=True)
@@ -236,13 +244,17 @@ class BlockFrame:
     name: str = ""
     params: frozenset[str] = frozenset()
     bound_vars: frozenset[str] = frozenset()
+    cond_vars: frozenset[str] = frozenset()
     local_vars: frozenset[str] = frozenset()
     shared_vars: frozenset[str] = frozenset()
+    unread_writes: frozenset[str] = frozenset()
     global_vars: frozenset[str] = frozenset()
     isinstance_vars: frozenset[str] = frozenset()
     hasattr_pairs: frozenset[tuple[str, str]] = frozenset()
     cond_sig: tuple[str, str] | None = None
     stmt_count: int = 0
+    only_docstring: bool = False
+    has_methods: bool = False
     terminal: bool = False
 
 
@@ -252,7 +264,9 @@ class SearchState:
 
     stack: tuple[BlockFrame, ...]
     module_vars: frozenset[str]
+    module_unread: frozenset[str]
     pending_dec: int | None
+    pending_method_dec: bool
     score: float
     indents: tuple[int, ...]
 
@@ -457,9 +471,15 @@ def split_top_level_physical_lines(source: str) -> list[str]:
     return chunks
 
 
-def _find_hashes_outside_strings(line: str) -> list[int]:
-    """Return all character offsets of ``#`` outside string literals in ``line``."""
+def _find_hashes_outside_strings(
+    line: str,
+    *,
+    final_line_only: bool = False,
+) -> list[int]:
+    """Return character offsets of top-level ``#`` outside string literals in ``line``."""
     positions: list[int] = []
+    last_nl = line.rfind("\n") if final_line_only else -1
+    depth = 0
     i = 0
     n = len(line)
     while i < n:
@@ -467,8 +487,21 @@ def _find_hashes_outside_strings(line: str) -> list[int]:
         if str_end is not None:
             i = str_end
             continue
-        if line[i] == "#":
-            positions.append(i)
+        ch = line[i]
+        if ch in ("(", "[", "{"):
+            depth += 1
+        elif ch in (")", "]", "}"):
+            depth = max(0, depth - 1)
+        elif ch == "#":
+            if final_line_only:
+                if i > last_nl and depth == 0:
+                    positions.append(i)
+                else:
+                    nl = line.find("\n", i)
+                    i = n if nl == -1 else nl + 1
+                    continue
+            else:
+                positions.append(i)
         i += 1
     return positions
 
@@ -935,35 +968,61 @@ def extract_logical_chunks(
     phys_lines = split_top_level_physical_lines(source_after_bridges)
     chunks: list[LogicalChunk] = []
     comments_split = 0
+    pending_blanks = 0
 
     for phys in phys_lines:
         stripped = phys.strip()
         if not stripped:
+            pending_blanks += 1
             continue
+        blanks = pending_blanks
+        pending_blanks = 0
+
         if stripped.startswith("# [shell]"):
-            chunks.append(LogicalChunk(code=stripped))
+            chunks.append(LogicalChunk(code=stripped, blank_lines_before=blanks))
             continue
 
-        hashes = _find_hashes_outside_strings(stripped)
+        is_multiline_chunk = "\n" in stripped
+        hashes = _find_hashes_outside_strings(
+            stripped,
+            final_line_only=(is_multiline_chunk and not split_inline_comments),
+        )
         if not hashes:
             segs = segment_code_chunk(stripped)
             if segs is None:
                 return None
-            chunks.extend(LogicalChunk(code=s) for s in segs)
+            for idx_s, s in enumerate(segs):
+                chunks.append(
+                    LogicalChunk(
+                        code=s, blank_lines_before=(blanks if idx_s == 0 else 0)
+                    )
+                )
             continue
 
         if not split_inline_comments:
             prefix = stripped[: hashes[0]].strip()
             comment_tail = stripped[hashes[0] :].strip()
             if not prefix:
-                chunks.append(LogicalChunk(code=comment_tail))
+                chunks.append(
+                    LogicalChunk(code=comment_tail, blank_lines_before=blanks)
+                )
             else:
                 segs = segment_code_chunk(prefix)
                 if segs is None or not segs:
                     return None
-                for s in segs[:-1]:
-                    chunks.append(LogicalChunk(code=s))
-                chunks.append(LogicalChunk(code=segs[-1], inline_comment=comment_tail))
+                for idx_s, s in enumerate(segs[:-1]):
+                    chunks.append(
+                        LogicalChunk(
+                            code=s, blank_lines_before=(blanks if idx_s == 0 else 0)
+                        )
+                    )
+                chunks.append(
+                    LogicalChunk(
+                        code=segs[-1],
+                        inline_comment=comment_tail,
+                        blank_lines_before=(blanks if len(segs) == 1 else 0),
+                    )
+                )
             continue
 
         # Collapsed-comment recovery mode
@@ -1194,6 +1253,7 @@ def analyze_chunk(chunk: LogicalChunk) -> ParsedLine:
             inline_comment=inline_comment,
             kind="comment",
             subkind="comment",
+            blank_lines_before=chunk.blank_lines_before,
         )
 
     if text.startswith("@"):
@@ -1201,12 +1261,16 @@ def analyze_chunk(chunk: LogicalChunk) -> ParsedLine:
         fn = tree.body[0]
         assert isinstance(fn, ast.FunctionDef)
         dec_expr = fn.decorator_list[0]
+        if isinstance(dec_expr, ast.Call):
+            dec_head = dec_expr.func
+        else:
+            dec_head = dec_expr
         is_method_dec = False
-        if isinstance(dec_expr, ast.Name) and dec_expr.id in METHOD_DECORATOR_NAMES:
+        if isinstance(dec_head, ast.Name) and dec_head.id in METHOD_DECORATOR_NAMES:
             is_method_dec = True
-        elif isinstance(dec_expr, ast.Attribute) and (
-            dec_expr.attr in METHOD_DECORATOR_NAMES
-            or dec_expr.attr in ("setter", "deleter", "getter")
+        elif isinstance(dec_head, ast.Attribute) and (
+            dec_head.attr in METHOD_DECORATOR_NAMES
+            or dec_head.attr in ("setter", "deleter", "getter")
         ):
             is_method_dec = True
         loads, attrs, calls = _extract_expr_reads_and_attrs(list(fn.decorator_list))
@@ -1219,6 +1283,7 @@ def analyze_chunk(chunk: LogicalChunk) -> ParsedLine:
             attr_reads=attrs,
             calls=calls,
             is_method_decorator=is_method_dec,
+            blank_lines_before=chunk.blank_lines_before,
         )
 
     if text.endswith(":"):
@@ -1242,6 +1307,11 @@ def analyze_chunk(chunk: LogicalChunk) -> ParsedLine:
                 assert isinstance(elif_node, ast.If)
                 expr_roots.append(elif_node.test)
                 isinst, hasat, sig, _ = _analyze_condition(elif_node.test)
+                for sub_w in ast.walk(elif_node.test):
+                    if isinstance(sub_w, ast.NamedExpr) and isinstance(
+                        sub_w.target, ast.Name
+                    ):
+                        frame_bound.add(sub_w.target.id)
             elif kw == "except":
                 try_node = probe.body[0]
                 assert isinstance(
@@ -1280,6 +1350,7 @@ def analyze_chunk(chunk: LogicalChunk) -> ParsedLine:
                 isinstance_vars=isinst,
                 hasattr_pairs=hasat,
                 cond_sig=sig,
+                blank_lines_before=chunk.blank_lines_before,
             )
 
         if probe is not None:
@@ -1292,7 +1363,11 @@ def analyze_chunk(chunk: LogicalChunk) -> ParsedLine:
                 else:
                     stmt = stmt.body[0]
                     needs_async = True
-                    subkind = "async_for" if isinstance(stmt, ast.AsyncFor) else "async_with"
+                    subkind = (
+                        "async_for"
+                        if isinstance(stmt, ast.AsyncFor)
+                        else "async_with"
+                    )
             else:
                 subkind = kw
 
@@ -1311,7 +1386,7 @@ def analyze_chunk(chunk: LogicalChunk) -> ParsedLine:
                 stores.add(stmt.name)
                 args = stmt.args
                 pos_params = args.posonlyargs + args.args
-                if pos_params and pos_params[0].arg in ("self", "cls"):
+                if pos_params and pos_params[0].arg in ("self", "cls", "mcls", "mcs"):
                     is_method = True
                 for param in pos_params + args.kwonlyargs:
                     frame_bound.add(param.arg)
@@ -1343,18 +1418,31 @@ def analyze_chunk(chunk: LogicalChunk) -> ParsedLine:
             elif isinstance(stmt, ast.While):
                 expr_roots.append(stmt.test)
                 isinst, hasat, sig, _ = _analyze_condition(stmt.test)
+                for sub_w in ast.walk(stmt.test):
+                    if isinstance(sub_w, ast.NamedExpr) and isinstance(
+                        sub_w.target, ast.Name
+                    ):
+                        frame_bound.add(sub_w.target.id)
             elif isinstance(stmt, ast.If):
                 expr_roots.append(stmt.test)
                 isinst, hasat, sig, is_main = _analyze_condition(stmt.test)
+                for sub_w in ast.walk(stmt.test):
+                    if isinstance(sub_w, ast.NamedExpr) and isinstance(
+                        sub_w.target, ast.Name
+                    ):
+                        frame_bound.add(sub_w.target.id)
             elif isinstance(stmt, (ast.With, ast.AsyncWith)):
                 for item in stmt.items:
                     expr_roots.append(item.context_expr)
                     if item.optional_vars is not None:
-                        _extract_target_stores(item.optional_vars, frame_bound, expr_roots)
+                        _extract_target_stores(
+                            item.optional_vars, frame_bound, expr_roots
+                        )
             elif isinstance(stmt, ast.Match):
                 expr_roots.append(stmt.subject)
 
             loads, attrs, calls = _extract_expr_reads_and_attrs(expr_roots)
+            cond_vars = loads if subkind == "while" else frozenset()
             return ParsedLine(
                 text=text,
                 inline_comment=inline_comment,
@@ -1366,12 +1454,14 @@ def analyze_chunk(chunk: LogicalChunk) -> ParsedLine:
                 calls=calls,
                 writes=frozenset(stores),
                 frame_bound=frozenset(frame_bound),
+                cond_vars=cond_vars,
                 isinstance_vars=isinst,
                 hasattr_pairs=hasat,
                 cond_sig=sig,
                 needs_async=needs_async,
                 is_method_def=is_method,
                 is_main_guard=is_main,
+                blank_lines_before=chunk.blank_lines_before,
             )
 
     # Simple statement(s)
@@ -1389,10 +1479,21 @@ def analyze_chunk(chunk: LogicalChunk) -> ParsedLine:
     stores = set()
     g_decl: set[str] = set()
     needs_func = False
+    needs_nonlocal = False
     is_global_stmt = False
     needs_async = False
     needs_loop = False
     is_valueless_ann = False
+    is_ann_assign = False
+    is_docstring = (
+        len(body) == 1
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    )
+    is_import = bool(body) and all(
+        isinstance(s, (ast.Import, ast.ImportFrom)) for s in body
+    )
 
     for st in body:
         if isinstance(st, ast.Assign):
@@ -1406,6 +1507,7 @@ def analyze_chunk(chunk: LogicalChunk) -> ParsedLine:
                 stores.add(st.target.id)
                 expr_roots.append(ast.Name(id=st.target.id, ctx=ast.Load()))
         elif isinstance(st, ast.AnnAssign):
+            is_ann_assign = True
             expr_roots.append(st.annotation)
             if st.value is not None:
                 expr_roots.append(st.value)
@@ -1442,7 +1544,7 @@ def analyze_chunk(chunk: LogicalChunk) -> ParsedLine:
             is_global_stmt = True
             g_decl.update(st.names)
         elif isinstance(st, ast.Nonlocal):
-            needs_func = True
+            needs_nonlocal = True
             g_decl.update(st.names)
 
         for sub in ast.walk(st):
@@ -1472,15 +1574,30 @@ def analyze_chunk(chunk: LogicalChunk) -> ParsedLine:
         is_terminal=is_terminal,
         is_return_or_raise=is_return_or_raise,
         needs_func=needs_func,
+        needs_nonlocal=needs_nonlocal,
         is_global_stmt=is_global_stmt,
         needs_async=needs_async,
         needs_loop=needs_loop,
         is_valueless_ann=is_valueless_ann,
+        is_ann_assign=is_ann_assign,
+        is_docstring=is_docstring,
+        is_import=is_import,
+        blank_lines_before=chunk.blank_lines_before,
     )
 
 
 def _has_enclosing_func(stack: Sequence[BlockFrame]) -> bool:
-    """Return ``True`` if any frame in ``stack`` is a ``def`` or ``async def``."""
+    """Return ``True`` if the innermost function/class scope in ``stack`` is a function."""
+    for frame in reversed(stack):
+        if frame.kind in ("def", "async_def"):
+            return True
+        if frame.kind == "class":
+            return False
+    return False
+
+
+def _has_enclosing_nonlocal_func(stack: Sequence[BlockFrame]) -> bool:
+    """Return ``True`` if any outer frame in ``stack`` is a ``def`` or ``async def``."""
     return any(f.kind in ("def", "async_def") for f in stack)
 
 
@@ -1495,9 +1612,9 @@ def _has_enclosing_async_func(stack: Sequence[BlockFrame]) -> bool:
 
 
 def _has_enclosing_loop(stack: Sequence[BlockFrame]) -> bool:
-    """Return ``True`` if ``stack`` has a loop without an intervening ``def`` or ``class``."""
+    """Return ``True`` if ``stack`` has an active loop body without an intervening ``def`` or ``class``."""
     for frame in reversed(stack):
-        if frame.kind in ("for", "async_for", "while"):
+        if frame.kind in ("for", "async_for", "while") and frame.clause == "body":
             return True
         if frame.kind in ("def", "async_def", "class"):
             return False
@@ -1537,9 +1654,9 @@ def _pop_frames_with_try_lift(
             lifted = top.local_vars | top.shared_vars
             if cur_list:
                 pf = cur_list[-1]
-                outer = set(mod_set)
-                for anc in cur_list[:-1]:
-                    outer.update(anc.bound_vars | anc.local_vars | anc.shared_vars)
+                outer = _same_lexical_scope_vars(
+                    frozenset(mod_set), cur_list, len(cur_list) - 1
+                )
                 cur_list[-1] = replace(
                     pf,
                     local_vars=pf.local_vars | (lifted - outer - pf.global_vars),
@@ -1549,17 +1666,54 @@ def _pop_frames_with_try_lift(
     return frozenset(mod_set), tuple(cur_list)
 
 
+def _clear_read_vars(
+    stack: Sequence[BlockFrame],
+    reads: frozenset[str],
+) -> list[BlockFrame]:
+    """Remove variables in ``reads`` from ``unread_writes`` across ``stack`` frames."""
+    if not reads:
+        return list(stack)
+    return [
+        replace(f, unread_writes=f.unread_writes - reads)
+        if (f.unread_writes & reads)
+        else f
+        for f in stack
+    ]
+
+
+def _same_lexical_scope_vars(
+    module_vars: frozenset[str],
+    stack: Sequence[BlockFrame],
+    frame_idx: int,
+) -> set[str]:
+    """Return variables already defined in the same Python lexical scope above ``stack[frame_idx]``."""
+    pf = stack[frame_idx]
+    if pf.kind in ("def", "async_def", "class"):
+        return set(pf.params | pf.bound_vars)
+
+    res: set[str] = set()
+    for idx in range(frame_idx - 1, -1, -1):
+        anc = stack[idx]
+        res.update(anc.params | anc.bound_vars | anc.local_vars | anc.shared_vars)
+        if anc.kind in ("def", "async_def", "class"):
+            return res
+
+    res.update(module_vars)
+    return res
+
+
 def _outer_defined_vars(
     module_vars: frozenset[str],
     stack: Sequence[BlockFrame],
     upto: int,
 ) -> set[str]:
-    """Collect all variable names bound or assigned in module + ``stack[:upto]``."""
+    """Collect all variable names accessible in module + ``stack[:upto]``."""
     res = set(module_vars)
     for idx in range(upto):
-        res.update(stack[idx].bound_vars)
-        res.update(stack[idx].local_vars)
-        res.update(stack[idx].shared_vars)
+        if stack[idx].kind != "class":
+            res.update(stack[idx].bound_vars)
+            res.update(stack[idx].local_vars)
+            res.update(stack[idx].shared_vars)
     return res
 
 
@@ -1578,6 +1732,10 @@ def render_chunk_at_indent(chunk: LogicalChunk, indent_level: int) -> str:
     i = 0
     n = len(code)
     while i < n:
+        if code[i] == "#":
+            nl = code.find("\n", i)
+            i = n if nl == -1 else nl + 1
+            continue
         se = _match_string_literal(code, i, require_closed=False)
         if se is not None:
             for pos in range(i, se):
@@ -1625,6 +1783,60 @@ def render_chunks(chunks: Sequence[LogicalChunk], indents: Sequence[int]) -> str
     )
 
 
+def _build_lookahead_requirements(
+    parsed: Sequence[ParsedLine],
+    code_indices: Sequence[int],
+) -> tuple[list[bool], list[bool], list[bool], list[bool], list[bool]]:
+    """Compute exact backward grammar-legality lookahead flags for each code step."""
+    k_len = len(code_indices)
+    req_func = [False] * k_len
+    req_async = [False] * k_len
+    req_loop = [False] * k_len
+    req_try = [False] * k_len
+    req_match = [False] * k_len
+
+    f_fn = False
+    f_as = False
+    f_lp = False
+    f_tr = False
+    f_ma = False
+
+    for step in range(k_len - 1, -1, -1):
+        req_func[step] = f_fn
+        req_async[step] = f_as
+        req_loop[step] = f_lp
+        req_try[step] = f_tr
+        req_match[step] = f_ma
+
+        cpl = parsed[code_indices[step]]
+        if cpl.kind == "primary" and cpl.subkind in ("def", "async_def"):
+            f_fn = cpl.needs_func or cpl.needs_nonlocal
+        elif cpl.needs_func or cpl.needs_nonlocal:
+            f_fn = True
+
+        if cpl.kind == "primary" and cpl.subkind == "async_def":
+            f_as = cpl.needs_async
+        elif cpl.needs_async:
+            f_as = True
+
+        if cpl.kind == "primary" and cpl.subkind in ("for", "async_for", "while"):
+            f_lp = cpl.needs_loop
+        elif cpl.needs_loop:
+            f_lp = True
+
+        if cpl.kind == "primary" and cpl.subkind == "try":
+            f_tr = False
+        elif cpl.kind == "clause" and cpl.subkind in ("except", "finally"):
+            f_tr = True
+
+        if cpl.kind == "primary" and cpl.subkind == "match":
+            f_ma = False
+        elif cpl.kind == "clause" and cpl.subkind == "case":
+            f_ma = True
+
+    return req_func, req_async, req_loop, req_try, req_match
+
+
 def infer_indents(
     chunks: Sequence[LogicalChunk],
     *,
@@ -1637,21 +1849,54 @@ def infer_indents(
     if not code_indices:
         return [0] * len(chunks)
 
+    (
+        fut_func,
+        fut_async,
+        fut_loop,
+        fut_try,
+        fut_match,
+    ) = _build_lookahead_requirements(parsed, code_indices)
+
     init = SearchState(
         stack=(),
         module_vars=frozenset(),
+        module_unread=frozenset(),
         pending_dec=None,
+        pending_method_dec=False,
         score=0.0,
         indents=(),
     )
     beam: list[SearchState] = [init]
 
-    for line_idx in code_indices:
+    for step_idx, line_idx in enumerate(code_indices):
         pl = parsed[line_idx]
+        need_fn_after = fut_func[step_idx]
+        need_as_after = fut_async[step_idx]
+        need_lp_after = fut_loop[step_idx]
+        need_tr_after = fut_try[step_idx]
+        need_ma_after = fut_match[step_idx]
+
         next_states: dict[tuple[object, ...], SearchState] = {}
 
         def register(st: SearchState) -> None:
             """Keep the highest-scoring state per equivalent stack signature."""
+            stk = st.stack
+            if need_fn_after and not any(
+                f.kind in ("def", "async_def") for f in stk
+            ):
+                return
+            if need_as_after and not any(f.kind == "async_def" for f in stk):
+                return
+            if need_lp_after and not any(
+                f.kind in ("for", "async_for", "while") and f.clause == "body"
+                for f in stk
+            ):
+                return
+            if need_tr_after and not any(f.kind == "try" for f in stk):
+                return
+            if need_ma_after and not any(f.kind == "match" for f in stk):
+                return
+
             sig = (
                 tuple(
                     (
@@ -1660,16 +1905,20 @@ def infer_indents(
                         f.had_except,
                         f.name,
                         f.stmt_count > 0,
+                        f.only_docstring,
+                        f.has_methods,
                         f.terminal,
                         f.bound_vars,
                         f.local_vars,
                         f.shared_vars,
+                        f.unread_writes,
                         f.isinstance_vars,
                         f.cond_sig,
                     )
-                    for f in st.stack
+                    for f in stk
                 ),
                 st.pending_dec,
+                st.pending_method_dec,
             )
             prev = next_states.get(sig)
             if prev is None or st.score > prev.score:
@@ -1685,6 +1934,10 @@ def infer_indents(
                     register(
                         replace(
                             st,
+                            module_unread=st.module_unread - pl.reads,
+                            pending_method_dec=(
+                                st.pending_method_dec or pl.is_method_decorator
+                            ),
                             score=st.score + 5.0,
                             indents=st.indents + (d_dec,),
                         )
@@ -1694,18 +1947,34 @@ def infer_indents(
                     "async_def",
                     "class",
                 ):
+                    dec_bonus = 10.0
+                    if pl.subkind in ("def", "async_def") and d_dec > 0:
+                        if st.stack[d_dec - 1].kind == "class":
+                            if pl.is_method_def or st.pending_method_dec:
+                                dec_bonus += 35.0
+                            else:
+                                dec_bonus -= 30.0
                     new_mod = st.module_vars | (
                         pl.writes if d_dec == 0 else frozenset()
                     )
-                    new_stack_list = list(st.stack)
+                    new_mod_unread = st.module_unread - pl.reads
+                    new_stack_list = [
+                        replace(f, unread_writes=f.unread_writes - pl.reads)
+                        for f in st.stack
+                    ]
                     if d_dec > 0:
                         pf = new_stack_list[d_dec - 1]
-                        outer = _outer_defined_vars(new_mod, st.stack, d_dec - 1)
+                        outer = _same_lexical_scope_vars(new_mod, st.stack, d_dec - 1)
                         added_local = pl.writes - outer - pf.global_vars
                         new_stack_list[d_dec - 1] = replace(
                             pf,
                             local_vars=pf.local_vars | added_local,
                             stmt_count=pf.stmt_count + 1,
+                            only_docstring=False,
+                            has_methods=(
+                                pf.has_methods
+                                or pl.subkind in ("def", "async_def")
+                            ),
                             terminal=False,
                         )
                     new_frame = BlockFrame(
@@ -1723,8 +1992,10 @@ def infer_indents(
                         SearchState(
                             stack=tuple(new_stack_list),
                             module_vars=new_mod,
+                            module_unread=new_mod_unread,
                             pending_dec=None,
-                            score=st.score + 10.0,
+                            pending_method_dec=False,
+                            score=st.score + dec_bonus,
                             indents=st.indents + (d_dec,),
                         )
                     )
@@ -1743,14 +2014,23 @@ def infer_indents(
                 and st.stack[-1].stmt_count == 0
             ):
                 if pl.kind == "clause" and pl.subkind == "case":
-                    mf = replace(st.stack[-1], stmt_count=1)
+                    cleaned = tuple(
+                        replace(f, unread_writes=f.unread_writes - pl.reads)
+                        for f in st.stack[:-1]
+                    )
+                    mf = replace(
+                        st.stack[-1],
+                        unread_writes=st.stack[-1].unread_writes - pl.reads,
+                        stmt_count=1,
+                    )
                     cf = BlockFrame(
                         kind="case", clause="case", bound_vars=pl.frame_bound
                     )
                     register(
                         replace(
                             st,
-                            stack=st.stack[:-1] + (mf, cf),
+                            module_unread=st.module_unread - pl.reads,
+                            stack=cleaned + (mf, cf),
                             score=st.score + 20.0,
                             indents=st.indents + (depth,),
                         )
@@ -1775,7 +2055,17 @@ def infer_indents(
                                 _can_pop_frame(st.stack[m])
                                 for m in range(d + 1, depth)
                             ):
-                                mf = replace(target, stmt_count=target.stmt_count + 1)
+                                cleaned_anc = tuple(
+                                    replace(
+                                        f, unread_writes=f.unread_writes - pl.reads
+                                    )
+                                    for f in stack_upto_target[:d]
+                                )
+                                mf = replace(
+                                    target,
+                                    unread_writes=target.unread_writes - pl.reads,
+                                    stmt_count=target.stmt_count + 1,
+                                )
                                 cf = BlockFrame(
                                     kind="case",
                                     clause="case",
@@ -1785,7 +2075,8 @@ def infer_indents(
                                     replace(
                                         st,
                                         module_vars=mod_after_pop,
-                                        stack=stack_upto_target[:d] + (mf, cf),
+                                        module_unread=st.module_unread - pl.reads,
+                                        stack=cleaned_anc + (mf, cf),
                                         score=st.score + 15.0,
                                         indents=st.indents + (d + 1,),
                                     )
@@ -1804,6 +2095,14 @@ def infer_indents(
                         for pf in popped_clauses
                         if pf.kind == "if" and pf.clause in ("body", "elif")
                     )
+
+                    for pf in popped_clauses:
+                        if pf.only_docstring and pf.kind in (
+                            "def",
+                            "async_def",
+                            "class",
+                        ):
+                            bonus -= 55.0
 
                     if kw == "elif":
                         if target.kind == "if" and target.clause in ("body", "elif"):
@@ -1853,6 +2152,10 @@ def infer_indents(
                     carried_shared = target.shared_vars | (
                         target.local_vars if target.kind == "try" else frozenset()
                     )
+                    cleaned_anc = tuple(
+                        replace(f, unread_writes=f.unread_writes - pl.reads)
+                        for f in stack_upto_target[:d]
+                    )
                     updated = BlockFrame(
                         kind=target.kind,
                         clause=new_clause,
@@ -1860,20 +2163,25 @@ def infer_indents(
                         name=target.name,
                         params=target.params,
                         bound_vars=pl.frame_bound,
+                        cond_vars=target.cond_vars,
                         local_vars=frozenset(),
                         shared_vars=carried_shared,
+                        unread_writes=frozenset(),
                         global_vars=target.global_vars,
                         isinstance_vars=pl.isinstance_vars,
                         hasattr_pairs=pl.hasattr_pairs,
                         cond_sig=pl.cond_sig or target.cond_sig,
                         stmt_count=0,
+                        only_docstring=False,
+                        has_methods=target.has_methods,
                         terminal=False,
                     )
                     register(
                         replace(
                             st,
                             module_vars=mod_after_pop,
-                            stack=stack_upto_target[:d] + (updated,),
+                            module_unread=st.module_unread - pl.reads,
+                            stack=cleaned_anc + (updated,),
                             score=st.score + bonus,
                             indents=st.indents + (d,),
                         )
@@ -1886,6 +2194,8 @@ def infer_indents(
                 popped = st.stack[d:]
 
                 if pl.needs_func and not _has_enclosing_func(kept):
+                    continue
+                if pl.needs_nonlocal and not _has_enclosing_nonlocal_func(kept):
                     continue
                 if pl.needs_async and not _has_enclosing_async_func(kept):
                     continue
@@ -1902,8 +2212,19 @@ def infer_indents(
                 if pl.is_main_guard:
                     delta += 80.0 if d == 0 else -80.0
 
+                if pl.blank_lines_before >= 2 and d == 0:
+                    delta += 6.0
+
                 if pl.is_global_stmt:
                     delta += 40.0 if _has_enclosing_func(kept) else -60.0
+
+                if (
+                    pl.is_docstring
+                    and d > 0
+                    and kept[-1].stmt_count == 0
+                    and kept[-1].kind in ("def", "async_def", "class")
+                ):
+                    delta += 30.0
 
                 if pl.needs_loop:
                     delta += 35.0 if _loop_has_guard(kept) else -35.0
@@ -1920,9 +2241,42 @@ def infer_indents(
                 if pl.kind == "primary" and pl.subkind in ("def", "async_def"):
                     if pl.is_method_def:
                         delta += 50.0 if (d > 0 and kept[-1].kind == "class") else -50.0
+                    elif d > 0 and kept[-1].kind == "class":
+                        delta -= 42.0
 
                 if pl.is_valueless_ann and d > 0 and kept[-1].kind == "class":
                     delta += 25.0
+
+                # PEP-8 ALL_CAPS constant assignments strongly belong at module/class scope
+                if (
+                    pl.kind == "simple"
+                    and pl.writes
+                    and not pl.is_import
+                    and all(len(w) >= 2 and w.isupper() for w in pl.writes)
+                ):
+                    if d == 0 or (d > 0 and kept[-1].kind == "class"):
+                        delta += 18.0
+                    elif _has_enclosing_func(kept):
+                        delta -= 12.0
+
+                # Pure overwrite vs dead-store / conditional flag-mutation scoring
+                pure_writes = (
+                    (pl.writes - pl.reads)
+                    if (pl.kind == "simple" and not pl.is_import)
+                    else frozenset()
+                )
+                for vw in pure_writes:
+                    if vw == "_" or vw.isupper():
+                        continue
+                    if d == 0 and vw in st.module_unread:
+                        delta -= 25.0
+                    elif d > 0 and vw in kept[d - 1].unread_writes:
+                        delta -= 35.0
+                    elif d > 0 and kept[d - 1].kind in ("if", "try", "case"):
+                        if vw in st.module_unread or any(
+                            vw in kept[anc].unread_writes for anc in range(d - 1)
+                        ):
+                            delta += 22.0
 
                 if (
                     pl.kind == "primary"
@@ -1936,6 +2290,19 @@ def infer_indents(
                             delta -= 45.0
 
                 for m, kf in enumerate(kept):
+                    # Class name does not exist directly inside its own class body!
+                    if (
+                        kf.kind == "class"
+                        and kf.name
+                        and kf.name in pl.reads
+                        and not pl.is_ann_assign
+                        and all(
+                            inner.kind not in ("def", "async_def")
+                            for inner in kept[m + 1 :]
+                        )
+                    ):
+                        delta -= 120.0
+
                     if kf.kind in ("def", "async_def", "class") and kf.name:
                         if kf.name in pl.calls:
                             if all(
@@ -1958,8 +2325,20 @@ def infer_indents(
                             delta -= 45.0
 
                 outer_at_d = _outer_defined_vars(mod_at_d, kept, d)
+                is_def_or_class_or_dec = pl.kind == "decorator" or (
+                    pl.kind == "primary"
+                    and pl.subkind in ("def", "async_def", "class")
+                )
 
                 for pf in popped:
+                    if (
+                        pf.only_docstring
+                        and pf.kind in ("def", "async_def", "class")
+                        and not is_def_or_class_or_dec
+                    ):
+                        delta -= 55.0
+                    if pf.kind == "while" and (pl.writes & pf.cond_vars):
+                        delta -= 18.0
                     is_parallel_isinst = (
                         pl.kind == "primary"
                         and pl.subkind == "if"
@@ -1980,18 +2359,56 @@ def infer_indents(
                         if pair in pf.hasattr_pairs:
                             delta -= 30.0
 
+                next_pl = (
+                    parsed[code_indices[step_idx + 1]]
+                    if step_idx + 1 < len(code_indices)
+                    else None
+                )
                 active_frame_indices: set[int] = set()
+                for m in range(d - 1, -1, -1):
+                    if kept[m].kind == "while":
+                        if pl.writes & kept[m].cond_vars:
+                            active_frame_indices.add(m)
+                            delta += 24.0
+                            break
+                        if (
+                            pl.kind == "primary"
+                            and pl.subkind == "if"
+                            and next_pl is not None
+                            and (next_pl.writes & kept[m].cond_vars)
+                        ):
+                            active_frame_indices.add(m)
+                            delta += 28.0
+                            break
+
                 for v in pl.reads:
+                    crossed_func = False
                     for m in range(d - 1, -1, -1):
                         kf = kept[m]
-                        if (
-                            v in kf.bound_vars
-                            or v in kf.local_vars
-                            or v in kf.shared_vars
-                        ):
+                        if crossed_func:
+                            if kf.kind in ("def", "async_def") and v in kf.params:
+                                active_frame_indices.add(m)
+                                delta += 18.0
+                                break
+                            continue
+                        if v in kf.bound_vars:
                             active_frame_indices.add(m)
                             delta += 26.0
                             break
+                        if v in kf.local_vars or v in kf.shared_vars:
+                            # `try: import x except: import x` exports `x` on pop too
+                            if (
+                                kf.kind == "try"
+                                and kf.clause != "body"
+                                and v in kf.shared_vars
+                                and v in kf.local_vars
+                            ):
+                                break
+                            active_frame_indices.add(m)
+                            delta += 26.0
+                            break
+                        if kf.kind in ("def", "async_def"):
+                            crossed_func = True
                     for m in range(d - 1, -1, -1):
                         kf = kept[m]
                         is_parallel = (
@@ -2034,40 +2451,76 @@ def infer_indents(
                             delta -= 10.0
                     elif kf.kind in ("with", "async_with"):
                         delta -= 8.0
+                    elif kf.kind == "try":
+                        if pl.kind == "primary" and pl.subkind in (
+                            "def",
+                            "async_def",
+                            "class",
+                        ):
+                            delta -= 22.0
+                        elif kf.clause == "body":
+                            delta -= 6.0
+                        else:
+                            delta -= 12.0
+                    elif kf.kind == "case":
+                        delta -= 10.0
+                    elif kf.kind == "class":
+                        if pl.kind == "primary" and pl.subkind == "class":
+                            delta -= 18.0
+                        elif kf.has_methods and not pl.writes and not pl.is_docstring:
+                            delta -= 20.0
+                        elif not pl.writes and not pl.is_docstring and not (
+                            pl.kind == "decorator"
+                            or (
+                                pl.kind == "primary"
+                                and pl.subkind in ("def", "async_def")
+                            )
+                        ):
+                            delta -= 10.0
                     elif kf.kind in ("def", "async_def"):
-                        if pl.is_global_stmt or pl.needs_func:
+                        if pl.is_global_stmt or pl.needs_func or pl.needs_nonlocal:
                             delta += 10.0
+                        elif is_def_or_class_or_dec:
+                            delta -= 12.0
                         elif kf.params and not (
                             pl.reads & (kf.params | kf.local_vars)
                         ):
                             delta -= 12.0
                         else:
-                            if pl.kind == "primary" and pl.subkind in ("def", "class"):
-                                delta -= 6.0
-                            else:
-                                delta += 4.0
+                            delta += 4.0
+
+                cleaned_kept = _clear_read_vars(kept, pl.reads)
+                new_mod_unread = st.module_unread - pl.reads
 
                 if pl.kind == "decorator":
                     register(
                         SearchState(
-                            stack=kept,
+                            stack=tuple(cleaned_kept),
                             module_vars=mod_at_d,
+                            module_unread=new_mod_unread,
                             pending_dec=d,
+                            pending_method_dec=pl.is_method_decorator,
                             score=st.score + delta,
                             indents=st.indents + (d,),
                         )
                     )
                 elif pl.kind == "primary":
                     new_mod = mod_at_d | (pl.writes if d == 0 else frozenset())
-                    kept_list = list(kept)
+                    if d == 0 and not pl.is_import:
+                        new_mod_unread = new_mod_unread | (pl.writes - pl.reads)
                     if d > 0:
-                        pf = kept_list[d - 1]
-                        outer_p = _outer_defined_vars(new_mod, kept, d - 1)
+                        pf = cleaned_kept[d - 1]
+                        outer_p = _same_lexical_scope_vars(new_mod, kept, d - 1)
                         added_local = pl.writes - outer_p - pf.global_vars
-                        kept_list[d - 1] = replace(
+                        cleaned_kept[d - 1] = replace(
                             pf,
                             local_vars=pf.local_vars | added_local,
                             stmt_count=pf.stmt_count + 1,
+                            only_docstring=False,
+                            has_methods=(
+                                pf.has_methods
+                                or pl.subkind in ("def", "async_def")
+                            ),
                             terminal=False,
                         )
                     new_frame = BlockFrame(
@@ -2079,42 +2532,57 @@ def infer_indents(
                             else frozenset()
                         ),
                         bound_vars=pl.frame_bound,
+                        cond_vars=pl.cond_vars,
                         isinstance_vars=pl.isinstance_vars,
                         hasattr_pairs=pl.hasattr_pairs,
                         cond_sig=pl.cond_sig,
                     )
-                    kept_list.append(new_frame)
+                    cleaned_kept.append(new_frame)
                     register(
                         SearchState(
-                            stack=tuple(kept_list),
+                            stack=tuple(cleaned_kept),
                             module_vars=new_mod,
+                            module_unread=new_mod_unread,
                             pending_dec=None,
+                            pending_method_dec=False,
                             score=st.score + delta,
                             indents=st.indents + (d,),
                         )
                     )
                 else:
                     new_mod = mod_at_d | (pl.writes if d == 0 else frozenset())
-                    kept_list = list(kept)
+                    if d == 0 and not pl.is_import:
+                        new_mod_unread = new_mod_unread | pure_writes
                     if d > 0:
-                        pf = kept_list[d - 1]
+                        pf = cleaned_kept[d - 1]
                         new_globals = pf.global_vars | pl.global_decl
                         if pl.global_decl:
                             new_mod = new_mod | pl.global_decl
-                        outer_p = _outer_defined_vars(new_mod, kept, d - 1)
+                        outer_p = _same_lexical_scope_vars(new_mod, kept, d - 1)
                         added_local = pl.writes - outer_p - new_globals
-                        kept_list[d - 1] = replace(
+                        added_unread = (
+                            (pure_writes - new_globals)
+                            if not pl.is_import
+                            else frozenset()
+                        )
+                        cleaned_kept[d - 1] = replace(
                             pf,
                             local_vars=pf.local_vars | added_local,
+                            unread_writes=pf.unread_writes | added_unread,
                             global_vars=new_globals,
                             stmt_count=pf.stmt_count + 1,
+                            only_docstring=(
+                                pf.stmt_count == 0 and pl.is_docstring
+                            ),
                             terminal=pl.is_terminal,
                         )
                     register(
                         SearchState(
-                            stack=tuple(kept_list),
+                            stack=tuple(cleaned_kept),
                             module_vars=new_mod,
+                            module_unread=new_mod_unread,
                             pending_dec=None,
+                            pending_method_dec=False,
                             score=st.score + delta,
                             indents=st.indents + (d,),
                         )
@@ -2122,9 +2590,41 @@ def infer_indents(
 
         if not next_states:
             return None
-        beam = sorted(next_states.values(), key=lambda s: s.score, reverse=True)[
-            :beam_width
-        ]
+
+        ranked = sorted(next_states.values(), key=lambda s: s.score, reverse=True)
+        if len(ranked) <= beam_width:
+            beam = ranked
+        else:
+            # Stratified beam: keep top global states + top representative per depth bucket
+            reserve = min(16, beam_width // 4)
+            core_limit = beam_width - reserve
+            selected: list[SearchState] = ranked[:core_limit]
+            seen_ids = {id(s) for s in selected}
+            seen_buckets: set[tuple[int, int]] = {
+                (
+                    len(s.stack),
+                    sum(1 for f in s.stack if f.kind in ("def", "async_def")),
+                )
+                for s in selected
+            }
+            for cand in ranked[core_limit:]:
+                bkt = (
+                    len(cand.stack),
+                    sum(1 for f in cand.stack if f.kind in ("def", "async_def")),
+                )
+                if bkt not in seen_buckets:
+                    seen_buckets.add(bkt)
+                    seen_ids.add(id(cand))
+                    selected.append(cand)
+                    if len(selected) >= beam_width:
+                        break
+            if len(selected) < beam_width:
+                for cand in ranked[core_limit:]:
+                    if id(cand) not in seen_ids:
+                        selected.append(cand)
+                        if len(selected) >= beam_width:
+                            break
+            beam = selected
 
     valid_final = [
         st
@@ -2179,10 +2679,13 @@ def reformat_source(
     Raises:
         ReformatterError: If ``source`` cannot be reconstructed into valid Python.
     """
+    normalized_source = source.replace("\r\n", "\n").replace("\r", "\n")
     orig_top_lines = [
-        ln for ln in split_top_level_physical_lines(source) if ln.strip()
+        ln
+        for ln in split_top_level_physical_lines(normalized_source)
+        if ln.strip()
     ]
-    was_valid = is_compilable_python(source, filename=filename)
+    was_valid = is_compilable_python(normalized_source, filename=filename)
 
     # Guard against single-line files like `import a # comment code...` where `#`
     # accidentally swallowed the rest of the collapsed program into a comment.
@@ -2200,11 +2703,11 @@ def reformat_source(
             swallowed_code_in_comment = True
 
     if was_valid and not force and not swallowed_code_in_comment:
-        tree = ast.parse(source, filename=filename)
+        tree = ast.parse(normalized_source, filename=filename)
         counts = collect_structural_counts(tree)
         comments = 0
         max_indent = 0
-        for line in source.splitlines():
+        for line in normalized_source.splitlines():
             stripped = line.lstrip(" ")
             if stripped:
                 leading = len(line) - len(stripped)
@@ -2223,7 +2726,7 @@ def reformat_source(
             counts=counts,
         )
 
-    preprocessed, bridges = isolate_shell_heredoc_bridges(source)
+    preprocessed, bridges = isolate_shell_heredoc_bridges(normalized_source)
 
     # Pass 1: if original input already had multiple physical lines, try without
     # splitting `#` comments first; if single-line collapsed, recover `#` comments first.

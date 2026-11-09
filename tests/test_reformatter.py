@@ -1,12 +1,13 @@
-"""Comprehensive pytest suite for the Python indentation autofixer."""
+"""Comprehensive pytest suite for the Python indentation and newline autofixer."""
 
 from __future__ import annotations
 
 import ast
 import json
+import os
 import pathlib
 import shutil
-import subprocess
+import tempfile
 import textwrap
 from typing import Any
 
@@ -23,7 +24,6 @@ from result.reformatter import (
 )
 
 REPO_ROOT: pathlib.Path = pathlib.Path(__file__).resolve().parent.parent
-INITIAL_COMMIT: str = "4f2c811a2a03a701545cd1a6e6dda2dd1b2dbb0f"
 
 EXPECTED_BROKEN_METRICS: dict[str, tuple[int, int]] = {
     "broken1.py": (39, 5),
@@ -41,19 +41,137 @@ EXPECTED_BROKEN_METRICS: dict[str, tuple[int, int]] = {
     "broken13.py": (36, 4),
 }
 
+DOS2UNIX_LSTRIP_INPUT: str = r'''import argparse
+import os
+import sys
+import tempfile
+from pathlib import Path
+def convert(data: bytes) -> bytes:
+"""Normalize CRLF and lone CR to LF without changing other bytes."""
+return data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+def convert_file(path: Path, *, keep_date: bool = False) -> bool:
+"""Convert a file in place. Return True if its contents changed."""
+original_stat = path.stat()
+data = path.read_bytes()
+converted = convert(data)
+if converted == data:
+return False
+fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir="/data/data/com.termux/files/usr/tmp")
+try:
+with os.fdopen(fd, "wb") as temp:
+temp.write(converted)
+temp.flush()
+os.fchmod(temp.fileno(), original_stat.st_mode)
+os.replace(temp_name, path)
+if keep_date:
+os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+except BaseException:
+try:
+os.unlink(temp_name)
+except FileNotFoundError:
+pass
+raise
+return True
+def main() -> int:
+parser = argparse.ArgumentParser(description="Convert DOS/Windows and classic Mac line endings to Unix LF.")
+parser.add_argument(
+"-k",
+"--keepdate",
+action="store_true",
+help="preserve the file's access and modification times",
+)
+parser.add_argument("files", nargs="+", metavar="FILE")
+args = parser.parse_args()
+status = 0
+for name in args.files:
+try:
+if name == "-":
+sys.stdout.buffer.write(convert(sys.stdin.buffer.read()))
+continue
+path = Path(name)
+changed = convert_file(path, keep_date=args.keepdate)
+print(f"{name}: {'converted' if changed else 'no change'}")
+except (OSError, ValueError) as exc:
+print(f"dos2unix: {name}: {exc}", file=sys.stderr)
+status = 1
+return status
+if __name__ == "__main__":
+raise SystemExit(main())
+'''
 
-def _load_original_broken_source(name: str) -> str:
-    """Load the original single-line broken file from the initial Git commit."""
-    proc = subprocess.run(
-        ["git", "show", f"{INITIAL_COMMIT}:{name}"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
+DOS2UNIX_EXPECTED_OUTPUT: str = r'''import argparse
+import os
+import sys
+import tempfile
+from pathlib import Path
+def convert(data: bytes) -> bytes:
+    """Normalize CRLF and lone CR to LF without changing other bytes."""
+    return data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+def convert_file(path: Path, *, keep_date: bool = False) -> bool:
+    """Convert a file in place. Return True if its contents changed."""
+    original_stat = path.stat()
+    data = path.read_bytes()
+    converted = convert(data)
+    if converted == data:
+        return False
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir="/data/data/com.termux/files/usr/tmp")
+    try:
+        with os.fdopen(fd, "wb") as temp:
+            temp.write(converted)
+            temp.flush()
+            os.fchmod(temp.fileno(), original_stat.st_mode)
+        os.replace(temp_name, path)
+        if keep_date:
+            os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+        raise
+    return True
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Convert DOS/Windows and classic Mac line endings to Unix LF.")
+    parser.add_argument(
+        "-k",
+        "--keepdate",
+        action="store_true",
+        help="preserve the file's access and modification times",
     )
-    if proc.returncode == 0 and proc.stdout:
-        return proc.stdout
-    return (REPO_ROOT / name).read_text(encoding="utf-8")
+    parser.add_argument("files", nargs="+", metavar="FILE")
+    args = parser.parse_args()
+    status = 0
+    for name in args.files:
+        try:
+            if name == "-":
+                sys.stdout.buffer.write(convert(sys.stdin.buffer.read()))
+                continue
+            path = Path(name)
+            changed = convert_file(path, keep_date=args.keepdate)
+            print(f"{name}: {'converted' if changed else 'no change'}")
+        except (OSError, ValueError) as exc:
+            print(f"dos2unix: {name}: {exc}", file=sys.stderr)
+            status = 1
+    return status
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+
+def _load_single_line_broken_source(name: str) -> str:
+    """Return the collapsed single-line broken representation of ``name``."""
+    raw = (REPO_ROOT / name).read_text(encoding="utf-8")
+    if raw.count("\n") == 1:
+        return raw
+    parts: list[str] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("# [shell] "):
+            stripped = stripped[len("# [shell] ") :]
+        parts.append(stripped)
+    return " ".join(parts) + "\n"
 
 
 def _collapse_to_single_line(code: str) -> str:
@@ -63,9 +181,9 @@ def _collapse_to_single_line(code: str) -> str:
     ) + "\n"
 
 
-def _strip_all_indents(code: str) -> str:
-    """Strip leading whitespace from every line while keeping newlines."""
-    return "\n".join(line.lstrip() for line in code.splitlines()) + "\n"
+def _lstrip_spaces_each_line(code: str) -> str:
+    """Apply ``line.lstrip(' ')`` to every line (OCR / Markdown extraction corruption)."""
+    return "\n".join(line.lstrip(" ") for line in code.splitlines()) + "\n"
 
 
 def _exec_namespace(code: str) -> dict[str, Any]:
@@ -84,8 +202,8 @@ def _exec_namespace(code: str) -> dict[str, Any]:
 def test_original_broken_files_reconstruct_and_compile(
     filename: str, tmp_path: pathlib.Path
 ) -> None:
-    """Every original broken*.py file reconstructs in-place to valid, idempotent Python."""
-    raw = _load_original_broken_source(filename)
+    """Every collapsed single-line broken*.py file reconstructs to valid, idempotent Python."""
+    raw = _load_single_line_broken_source(filename)
     assert raw.count("\n") == 1, f"Expected single-line input for {filename}"
 
     target = tmp_path / filename
@@ -117,34 +235,29 @@ def test_original_broken_files_reconstruct_and_compile(
 
 def test_specific_structural_semantics_of_repo_examples() -> None:
     """Verify exact block nesting on the trickiest repo examples."""
-    # broken1.py: `elif isinstance(n, ast.ClassDef):` pairs with outer `if isinstance(...)`
-    b1 = reformat_source(_load_original_broken_source("broken1.py")).source
+    b1 = reformat_source(_load_single_line_broken_source("broken1.py")).source
     tree1 = ast.parse(b1)
     top_for1 = [n for n in tree1.body if isinstance(n, ast.For)]
     assert len(top_for1) == 1
-    # Inside `for f in files:` -> `try` and `for n in ast.walk(t):`
     assert isinstance(top_for1[0].body[0], ast.Try)
     assert isinstance(top_for1[0].body[1], ast.For)
     walk_if = top_for1[0].body[1].body[0]
     assert isinstance(walk_if, ast.If)
     assert len(walk_if.orelse) == 1 and isinstance(walk_if.orelse[0], ast.If)
 
-    # broken5.py: code after `# survey common param...` must NOT be swallowed into comment
-    b5 = reformat_source(_load_original_broken_source("broken5.py"))
+    b5 = reformat_source(_load_single_line_broken_source("broken5.py"))
     assert b5.inline_comments_split == 1
     assert b5.counts.loops == 2
     assert b5.counts.try_blocks == 1
 
-    # broken6.py: `def prep(t):` contains two top-level loops + `t.body = ...` + `return`
-    b6 = reformat_source(_load_original_broken_source("broken6.py")).source
+    b6 = reformat_source(_load_single_line_broken_source("broken6.py")).source
     tree6 = ast.parse(b6)
     funcs6 = [n for n in tree6.body if isinstance(n, ast.FunctionDef)]
     assert len(funcs6) == 1 and funcs6[0].name == "prep"
     assert isinstance(funcs6[0].body[-1], ast.Return)
 
-    # broken11-13: shell heredoc bridges preserved as `# [shell]` comments
     for idx in (11, 12, 13):
-        res = reformat_source(_load_original_broken_source(f"broken{idx}.py"))
+        res = reformat_source(_load_single_line_broken_source(f"broken{idx}.py"))
         assert res.shell_bridges_commented == 1
         assert "# [shell] PY cd " in res.source
 
@@ -164,7 +277,157 @@ def test_workspace_broken_files_compile_cleanly(
 
 
 # ---------------------------------------------------------------------------
-# 2. Execution-Equivalence Round-Trip Tests (Single-Line & Stripped-Indent)
+# 2. OCR / Markdown `line.lstrip(' ')` Indentation-Stripped File Tests
+# ---------------------------------------------------------------------------
+
+
+def test_lstrip_dos2unix_example_exact_and_executable(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The OCR/Markdown `lstrip(' ')` dos2unix example reconstructs line-for-line and executes."""
+    assert not is_compilable_python(DOS2UNIX_LSTRIP_INPUT)
+
+    target = tmp_path / "dos2unix_ocr.py"
+    target.write_text(DOS2UNIX_LSTRIP_INPUT, encoding="utf-8")
+
+    stats = reformat_file(target, in_place=True)
+    assert stats.status == "fixed"
+    assert stats.changed is True
+    assert stats.was_valid_before is False
+    assert stats.is_valid_after is True
+    assert stats.original_lines == 56
+    assert stats.fixed_lines == 56
+    assert stats.functions == 3
+    assert stats.try_blocks == 3
+
+    repaired = target.read_text(encoding="utf-8")
+    assert repaired == DOS2UNIX_EXPECTED_OUTPUT
+
+    # Execute repaired module and test `convert` + `convert_file` behavior
+    ns = _exec_namespace(repaired)
+    assert ns["convert"](b"line1\r\nline2\rline3\n") == b"line1\nline2\nline3\n"
+
+    orig_mkstemp = tempfile.mkstemp
+
+    def _sandbox_mkstemp(
+        suffix: str | None = None,
+        prefix: str | None = None,
+        dir: str | os.PathLike[str] | None = None,
+        text: bool = False,
+    ) -> tuple[int, str]:
+        """Redirect hardcoded Termux temp dir in the example to ``tmp_path``."""
+        _ = dir
+        return orig_mkstemp(suffix=suffix, prefix=prefix, dir=tmp_path, text=text)
+
+    monkeypatch.setattr(tempfile, "mkstemp", _sandbox_mkstemp)
+
+    sample = tmp_path / "sample.txt"
+    sample.write_bytes(b"hello\r\nworld\r\n")
+    os.utime(sample, ns=(1_700_000_000_000_000_000, 1_700_000_123_000_000_000))
+    assert ns["convert_file"](sample, keep_date=True) is True
+    assert sample.read_bytes() == b"hello\nworld\n"
+    assert sample.stat().st_mtime_ns == 1_700_000_123_000_000_000
+    assert ns["convert_file"](sample, keep_date=True) is False
+
+
+@pytest.mark.parametrize("filename", list(EXPECTED_BROKEN_METRICS.keys()))
+def test_lstrip_repo_broken_files_byte_exact(
+    filename: str, tmp_path: pathlib.Path
+) -> None:
+    """Every formatted broken*.py file stripped via `line.lstrip(' ')` recovers byte-identically."""
+    formatted = (REPO_ROOT / filename).read_text(encoding="utf-8")
+    assert is_compilable_python(formatted, filename=filename)
+
+    stripped = _lstrip_spaces_each_line(formatted)
+    copied = tmp_path / filename
+    copied.write_text(stripped, encoding="utf-8")
+
+    stats = reformat_file(copied, in_place=True)
+    assert stats.is_valid_after is True
+    assert copied.read_text(encoding="utf-8") == formatted
+
+
+@pytest.mark.parametrize(
+    "module_path",
+    [
+        REPO_ROOT / "result" / "__init__.py",
+        REPO_ROOT / "result" / "__main__.py",
+        REPO_ROOT / "result" / "reformatter.py",
+        REPO_ROOT / "tests" / "test_reformatter.py",
+        pathlib.Path("/usr/lib/python3.11/_aix_support.py"),
+        pathlib.Path("/usr/lib/python3.11/abc.py"),
+        pathlib.Path("/usr/lib/python3.11/bisect.py"),
+        pathlib.Path("/usr/lib/python3.11/contextlib.py"),
+    ],
+)
+def test_lstrip_real_world_python_modules_reconstruct_cleanly(
+    module_path: pathlib.Path,
+) -> None:
+    """Real multi-hundred-line modules stripped via `line.lstrip(' ')` reconstruct to valid Python."""
+    if not module_path.exists():
+        pytest.skip(f"{module_path} not present on this platform")
+
+    original = module_path.read_text(encoding="utf-8")
+    stripped = _lstrip_spaces_each_line(original)
+
+    result = reformat_source(stripped, filename=module_path.name, force=True)
+    assert is_compilable_python(result.source, filename=module_path.name)
+
+
+def test_lstrip_comments_with_apostrophes_and_brackets_inside_multiline_literals() -> None:
+    """Internal `#` comments inside multi-line `(...)` / `[...]` / `{...}` are preserved intact."""
+    original = textwrap.dedent(
+        """\
+        CONFIG = [
+            "alpha",  # don't split on ] or 'apostrophe' inside comment
+            "beta",   # (another [nested] bracket comment)
+        ]
+        def summarize(items: list[str]) -> str:
+            flag = "empty"
+            for item in items:
+                if item == "missing":
+                    flag = "bad"
+            return f"{flag}:{len(items)}"
+        answer = summarize(CONFIG)
+        """
+    )
+    stripped = _lstrip_spaces_each_line(original)
+    assert not is_compilable_python(stripped)
+
+    res = reformat_source(stripped)
+    assert is_compilable_python(res.source)
+    assert "# don't split on ] or 'apostrophe' inside comment" in res.source
+    ns = _exec_namespace(res.source)
+    assert ns["answer"] == "empty:2"
+
+
+def test_lstrip_crlf_line_endings_and_while_condition_mutation() -> None:
+    """CRLF `lstrip(' ')` inputs and `while` loop condition updates indent accurately."""
+    original = textwrap.dedent(
+        """\
+        def read_until_valid(responses: list[str]) -> str:
+            idx = 0
+            key = None
+            while key is None:
+                key = responses[idx]
+                idx += 1
+                if key not in ("ok", "quit"):
+                    key = None
+            return key
+        picked = read_until_valid(["bad", "nope", "ok", "quit"])
+        """
+    )
+    stripped_crlf = "\r\n".join(
+        line.lstrip(" ") for line in original.splitlines()
+    ) + "\r\n"
+    res = reformat_source(stripped_crlf)
+    assert is_compilable_python(res.source)
+    ns = _exec_namespace(res.source)
+    assert ns["picked"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# 3. Execution-Equivalence Round-Trip Tests (Single-Line & Stripped-Indent)
 # ---------------------------------------------------------------------------
 
 
@@ -191,7 +454,7 @@ ROUNDTRIP_PROGRAMS: list[str] = [
         summary = (pos, neg, zero, errors)
         """
     ),
-    # Functions, closures, recursion guard, ternary expressions, comprehensions
+    # Functions, closures, ternary expressions, comprehensions
     textwrap.dedent(
         """\
         def make_scaler(factor: int):
@@ -206,7 +469,7 @@ ROUNDTRIP_PROGRAMS: list[str] = [
         result = scaler([2, -1, 5])
         """
     ),
-    # Dataclass / class with multiple methods, @staticmethod, @property
+    # Class with multiple methods, @staticmethod, @property
     textwrap.dedent(
         """\
         class CounterBox:
@@ -251,7 +514,7 @@ ROUNDTRIP_PROGRAMS: list[str] = [
 
 
 @pytest.mark.parametrize("program", ROUNDTRIP_PROGRAMS)
-@pytest.mark.parametrize("mode", ["single_line", "stripped_lines"])
+@pytest.mark.parametrize("mode", ["single_line", "lstrip_spaces"])
 def test_execution_equivalence_after_corruption(program: str, mode: str) -> None:
     """Corrupting valid programs and repairing them preserves exact runtime behavior."""
     expected_ns = _exec_namespace(program)
@@ -259,7 +522,7 @@ def test_execution_equivalence_after_corruption(program: str, mode: str) -> None
     corrupted = (
         _collapse_to_single_line(program)
         if mode == "single_line"
-        else _strip_all_indents(program)
+        else _lstrip_spaces_each_line(program)
     )
     assert not is_compilable_python(corrupted)
 
@@ -273,7 +536,7 @@ def test_execution_equivalence_after_corruption(program: str, mode: str) -> None
 
 
 # ---------------------------------------------------------------------------
-# 3. Tricky Grammar, Comment, String, Async, and Matrix-Multiply Edge Cases
+# 4. Tricky Grammar, Comment, String, Async, and Matrix-Multiply Edge Cases
 # ---------------------------------------------------------------------------
 
 
@@ -377,7 +640,7 @@ def test_unrecoverable_syntax_raises_reformatter_error() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 4. CLI, Batch Discovery, Dry-Run, JSON Output, and Error Handling Tests
+# 5. CLI, Batch Discovery, Dry-Run, JSON Output, and Error Handling Tests
 # ---------------------------------------------------------------------------
 
 
@@ -390,7 +653,7 @@ def test_cli_dry_run_and_inplace_and_json(
     f1 = sub / "broken_a.py"
     f2 = sub / "broken_b.py"
     raw_a = "def inc(x: int) -> int: if x > 0: return x + 1 return 0\n"
-    raw_b = "vals = [] for i in range(4): vals.append(i * i) total = sum(vals)\n"
+    raw_b = _lstrip_spaces_each_line(DOS2UNIX_EXPECTED_OUTPUT)
     f1.write_text(raw_a, encoding="utf-8")
     f2.write_text(raw_b, encoding="utf-8")
 
@@ -400,6 +663,7 @@ def test_cli_dry_run_and_inplace_and_json(
     out_dry = capsys.readouterr().out
     assert "DRY-RUN" in out_dry
     assert f1.read_text(encoding="utf-8") == raw_a
+    assert f2.read_text(encoding="utf-8") == raw_b
 
     # In-place with --json modifies files and prints valid JSON BatchStats
     rc_json = main(["--json", str(sub)])
@@ -409,9 +673,8 @@ def test_cli_dry_run_and_inplace_and_json(
     assert payload["fixed_files"] == 2
     assert payload["failed_files"] == 0
     assert is_compilable_python(f1.read_text(encoding="utf-8"))
-    assert is_compilable_python(f2.read_text(encoding="utf-8"))
+    assert f2.read_text(encoding="utf-8") == DOS2UNIX_EXPECTED_OUTPUT
 
-    # Batch API check
     batch: BatchStats = reformat_paths([sub], in_place=False)
     assert batch.unchanged_files == 2
 
@@ -428,7 +691,7 @@ def test_cli_missing_path_and_failed_file_exit_codes(
 
 
 # ---------------------------------------------------------------------------
-# 5. Self-Check: Full Type Annotations & Docstrings on result/*
+# 6. Self-Check: Full Type Annotations & Docstrings on result/*
 # ---------------------------------------------------------------------------
 
 
